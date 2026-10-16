@@ -115,9 +115,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # per-step graph_task_update of host-side parameters. The Triton kernel
     # takes device-side metadata, so it is captured into the aclgraph directly
     # and needs no host parameter refresh between decode steps.
-    # 0 (default): keep the aclnnCausalConv1d + graph_task_update path.
-    # 1: use the Triton causal_conv1d_update_npu kernel (requires Triton / 910B).
-    "VLLM_ASCEND_GDN_TRITON_CONV": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_TRITON_CONV", "0"))),
+    # 0: keep the aclnnCausalConv1d + graph_task_update path.
+    # 1 (default since 10-16): use the Triton causal_conv1d_update_npu kernel
+    #    (requires Triton / 910B). PIECIEWISE capture falls back to aclnn.
+    "VLLM_ASCEND_GDN_TRITON_CONV": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_TRITON_CONV", "1"))),
     # Whether to use the Triton paged GQA decode attention kernel for the
     # full-attention decode/speculative paths instead of
     # npu_fused_infer_attention_score. The Triton kernel reads all metadata
@@ -128,9 +129,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # deadlock in PIECEWISE capture with num_speculative_tokens >= 2) and to
     # causal decode-shaped batches (max_query_len <= 16, no sliding window /
     # sinks / alibi / sparse / c8-quant). Everything else falls back to FIA.
-    # 0 (default): keep the FIA path.
-    # 1: use the Triton paged decode attention kernel (requires Triton / 910B).
-    "VLLM_ASCEND_TRITON_ATTN": lambda: bool(int(os.getenv("VLLM_ASCEND_TRITON_ATTN", "0"))),
+    # 0: keep the FIA path.
+    # 1 (default since 10-16): use the Triton paged decode attention kernel
+    #    (requires Triton / 910B). PIECIEWISE falls back to FIA.
+    "VLLM_ASCEND_TRITON_ATTN": lambda: bool(int(os.getenv("VLLM_ASCEND_TRITON_ATTN", "1"))),
     # Fused TP vocab-shard masking (VocabParallelEmbedding._get_masked_input_and_mask)
     # as a single Triton kernel instead of ~7 pointwise eager kernels whose
     # cost is host dispatch. Runs on every embedding lookup and every lm_head
