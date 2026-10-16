@@ -17,9 +17,12 @@
 
 import torch
 import torch_npu
+import os
 from einops import rearrange
+from vllm.config import CUDAGraphMode
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
 
 from vllm_ascend.utils import vllm_version_is
@@ -47,8 +50,22 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
-from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_fn
+from vllm_ascend.ops.triton.mamba.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update_npu,
+)
 from vllm_ascend.utils import weak_ref_tensors
+
+
+# Module-level diag flag: evaluated once at import so torch.compile sees a
+# constant condition (os.environ access inside a compiled region graph-breaks).
+_AWQ_DIAG = os.environ.get("VLLM_ASCEND_AWQ_DIAG", "0") == "1"
+
+# Module-level switch for the GDN decode/spec causal-conv1d update path:
+# 1 -> Triton kernel with device-side metadata (captured into the aclgraph
+# directly, no per-step host graph_task_update); 0 -> aclnnCausalConv1d +
+# graph_task_update. Evaluated once at import; see vllm_ascend/envs.py.
+_GDN_TRITON_CONV = os.environ.get("VLLM_ASCEND_GDN_TRITON_CONV", "0") == "1"
 
 
 def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
@@ -150,6 +167,12 @@ def update_conv1d_graph_params(
     draft_attn_metadatas=None,
 ):
     """Update host-side parameters for conv1d."""
+    if _GDN_TRITON_CONV:
+        # The Triton conv path feeds device-side metadata tensors straight to
+        # the kernel, so nothing was registered in conv1d_params and there is
+        # no host parameter update to perform for this step.
+        return
+
     from vllm_ascend.compilation.acl_graph import get_draft_graph_params, get_graph_params
 
     graph_params = get_draft_graph_params() if is_draft_model else get_graph_params()
@@ -251,6 +274,23 @@ def get_non_spec_chunked_prefill_meta(attn_metadata):
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def _get_conv_weights_t(self) -> torch.Tensor:
+        """Contiguous [kernel, dim] conv weight, cached across steps.
+
+        ``conv_weights.transpose(0, 1)`` is a non-contiguous view; passing it to
+        aclnnCausalConv1d triggers an aclnnContiguous copy on every call --
+        both inside the captured graph and inside every per-step
+        graph_task_update (30+ times per decode step, ~100us host each).
+        """
+        w = getattr(self, "_conv_weights_t", None)
+        if w is None or w.device != self.conv1d.weight.device:
+            cw = self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            )
+            w = cw.transpose(0, 1).contiguous()
+            self._conv_weights_t = w
+        return w
+
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
             return self.split_ba(ba)
@@ -286,11 +326,52 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         2. Core attention (custom op)
         3. Output projection
         """
+        def _sync_diag(label: str):
+            if not _AWQ_DIAG:
+                return
+            try:
+                torch.npu.synchronize()
+                logger.warning("[AWQ_DIAG] %s synchronize ok", label)
+            except Exception as e:
+                logger.warning("[AWQ_DIAG] %s synchronize FAILED: %s", label, e)
+                raise
+
+        def _log_linear(name: str, layer):
+            if not _AWQ_DIAG:
+                return
+            qweight = hasattr(layer, "qweight")
+            qmethod = type(getattr(layer, "quant_method", None)).__name__
+            weight = getattr(layer, "weight", None)
+            fmt = "N/A"
+            if weight is not None and weight.device.type == "npu":
+                try:
+                    fmt = str(torch_npu.get_npu_format(weight))
+                except Exception:
+                    fmt = "unknown"
+            logger.warning(
+                "[AWQ_DIAG] GDN linear %s: type=%s quant_method=%s has_qweight=%s "
+                "weight_shape=%s weight_dtype=%s weight_format=%s",
+                name,
+                type(layer).__name__,
+                qmethod,
+                qweight,
+                str(getattr(weight, "shape", None)),
+                str(getattr(weight, "dtype", None)),
+                fmt,
+            )
+
         num_tokens = hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
+            _sync_diag("before in_proj_qkv")
+            _log_linear("in_proj_qkv", self.in_proj_qkv)
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+            _sync_diag("after in_proj_qkv")
+            _sync_diag("before in_proj_ba")
+            _log_linear("in_proj_ba", self.in_proj_ba)
             ba, _ = self.in_proj_ba(hidden_states)
+            _sync_diag("after in_proj_ba")
             z, _ = self.in_proj_z(hidden_states)
+            _sync_diag("after in_proj_z")
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             if vllm_version_is("0.21.0"):
                 b, a = ba.chunk(2, dim=-1)
@@ -298,15 +379,24 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b, a = self.split_ba(ba)
             b = b.contiguous()
             a = a.contiguous()
+            _sync_diag("after chunk/contiguous")
         else:
             if not self.gqa_interleaved_layout:
+                _sync_diag("before in_proj_qkvz")
+                _log_linear("in_proj_qkvz", self.in_proj_qkvz)
                 mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                _sync_diag("after in_proj_qkvz")
                 num_tokens = mixed_qkvz.size(0)
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
                 z_size = self.value_dim // self.tp_size
                 mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                _sync_diag("after split qkv/z")
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
+                _sync_diag("after z reshape")
+                _sync_diag("before in_proj_ba")
+                _log_linear("in_proj_ba", self.in_proj_ba)
                 ba, _ = self.in_proj_ba(hidden_states)
+                _sync_diag("after in_proj_ba")
                 if vllm_version_is("0.21.0"):
                     b, a = ba.chunk(2, dim=-1)
                 else:
@@ -314,9 +404,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
                 b = b.contiguous()
                 a = a.contiguous()
+                _sync_diag("after ba chunk/contiguous")
             else:
+                _sync_diag("before in_proj_qkvz")
+                _log_linear("in_proj_qkvz", self.in_proj_qkvz)
                 projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                _sync_diag("after in_proj_qkvz")
+                _sync_diag("before in_proj_ba")
+                _log_linear("in_proj_ba", self.in_proj_ba)
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                _sync_diag("after in_proj_ba")
                 num_tokens = projected_states_qkvz.size(0)
 
                 mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
@@ -327,6 +424,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self.head_k_dim,
                     self.head_v_dim,
                 )
+                _sync_diag("after fused_qkvzba_split_reshape_cat")
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -338,6 +436,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        _sync_diag("after core_attn_out zeros")
+
+        # Diagnostic: isolate whether the context corruption comes from the
+        # input projection (AWQ linear) or from the GDN custom op itself.
+        _sync_diag("gdn pre-core")
 
         if vllm_version_is("0.21.0"):
             torch.ops.vllm.gdn_attention_core(
@@ -358,6 +461,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.prefix,
             )
 
+        # Workaround: gdn_attention_core can leave the current ACL context
+        # unbound, causing subsequent NPU ops / Triton kernels to fail with
+        # ERR00100. Explicitly re-bind the device here -- but ONLY in eager
+        # mode. Under torch.compile the device is bound for the whole captured
+        # region, and torch.npu.set_device() itself is a hard Dynamo graph
+        # break (gb0007 "Attempted to call function marked as skipped") that
+        # aborts capture. is_compiling() is constant-folded by Dynamo, so the
+        # call is pruned from the compiled graph and kept for eager runs.
+        if not torch.compiler.is_compiling():
+            torch.npu.set_device(core_attn_out.device)
+
+        _sync_diag("after gdn_attention_core")
+
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
@@ -370,6 +486,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+        _sync_diag("after out_proj")
 
     def _forward_core(
         self,
@@ -386,11 +503,31 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         if attn_metadata is None:
             # V1 profile run
+            if _AWQ_DIAG:
+                import logging as _logging
+                _logging.getLogger(__name__).info("[AWQ_DIAG] _forward_core: attn_metadata is None, skipping core ops")
             return
 
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+
+        # The Triton update kernel deadlocks inside PIECEWISE (mixed
+        # prefill-decode) graph capture when num_speculative_tokens >= 2.
+        # PIECEWISE splitting ops (gdn_attention_core) execute eagerly anyway,
+        # so keep the proven aclnn host-args path there; use Triton for eager
+        # decode and FULL-graph capture/replay (the decode hot path).
+        use_triton_conv = _GDN_TRITON_CONV and (
+            forward_context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+        )
+
+        if _AWQ_DIAG:
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "[AWQ_DIAG] _forward_core: running core ops num_prefills=%s num_decodes=%s num_spec_decodes=%s",
+                attn_metadata.num_prefills, attn_metadata.num_decodes, attn_metadata.num_spec_decodes
+            )
+
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
@@ -423,11 +560,36 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
-            (spec_qsl_host, spec_ci_host, spec_nat_host) = get_spec_causal_conv1d_update_host_args(attn_metadata)
+            if use_triton_conv:
+                # Triton causal-conv1d update. All metadata (query_start_loc,
+                # cache indices, num_accepted_tokens) is device-side, so the
+                # kernel is captured into the aclgraph as-is and no conv1d
+                # graph-task params are registered for per-step updates.
+                # conv_state is the SD-layout cache [lines, state_len, dim]
+                # (state_len = kernel_width - 1 + num_spec); conv_weights is
+                # the contiguous (dim, kernel_width) view. Outputs overwrite
+                # mixed_qkv_spec in place, which is safe: it is either a fresh
+                # index_select result or, in the pure-spec case, the conv
+                # input itself whose pre-conv values are not needed afterwards.
+                mixed_qkv_spec = causal_conv1d_update_npu(
+                    mixed_qkv_spec,
+                    self_kv_cache[0],
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_state_indices=spec_state_indices_tensor[:, 0],
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=spec_query_start_loc,
+                    max_query_len=attn_metadata.spec_state_indices_tensor.size(-1),
+                    pad_slot_id=PAD_SLOT_ID,
+                    inputs_in_kernel_layout=True,
+                )
+            else:
+                conv_weights_T = conv_weights.transpose(0, 1)
+                (spec_qsl_host, spec_ci_host, spec_nat_host) = get_spec_causal_conv1d_update_host_args(attn_metadata)
             # capturing branch for conv1d update
-            if _EXTRA_CTX.capturing:
+            if _EXTRA_CTX.capturing and not use_triton_conv:
                 stream = torch_npu.npu.current_stream()
                 event = torch.npu.ExternalEvent()
                 event.wait(stream)
@@ -479,7 +641,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 handle = torch.npu.graph_task_group_end(stream)
                 graph_params.conv1d_handles[num_actual_tokens].append(handle)
                 mixed_qkv_spec = output_spec
-            else:
+            elif not use_triton_conv:
                 # for enforce eager
                 output_spec = torch.empty_like(mixed_qkv_spec)
                 torch.ops._C_ascend.npu_causal_conv1d_custom(
@@ -542,11 +704,29 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
         elif attn_metadata.num_decodes > 0:
-            conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
-            non_spec_qsl_host, non_spec_ci_host = get_causal_conv1d_update_host_args(attn_metadata)
+            if use_triton_conv:
+                # Triton causal-conv1d update; see the spec branch above for
+                # the layout/safety rationale. Non-spec decode has one query
+                # token per request, so max_query_len = 1 and no
+                # num_accepted_tokens (plain shift-by-one state update).
+                mixed_qkv_non_spec = causal_conv1d_update_npu(
+                    mixed_qkv_non_spec,
+                    self_kv_cache[0],
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor,
+                    query_start_loc=non_spec_query_start_loc,
+                    max_query_len=1,
+                    pad_slot_id=PAD_SLOT_ID,
+                    inputs_in_kernel_layout=True,
+                )
+            else:
+                conv_weights_T = conv_weights.transpose(0, 1)
+                non_spec_qsl_host, non_spec_ci_host = get_causal_conv1d_update_host_args(attn_metadata)
             # graph capture branch
-            if _EXTRA_CTX.capturing:
+            if _EXTRA_CTX.capturing and not use_triton_conv:
                 stream = torch_npu.npu.current_stream()
                 event = torch.npu.ExternalEvent()
                 event.wait(stream)
@@ -595,7 +775,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 handle = torch.npu.graph_task_group_end(stream)
                 graph_params.conv1d_handles[num_actual_tokens].append(handle)
                 mixed_qkv_non_spec = output_non_spec
-            else:
+            elif not use_triton_conv:
                 output_non_spec = torch.empty_like(mixed_qkv_non_spec)
                 torch.ops._C_ascend.npu_causal_conv1d_custom(
                     output_non_spec,

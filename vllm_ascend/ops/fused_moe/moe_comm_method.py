@@ -294,6 +294,11 @@ class FusedMC2CommImpl(MoECommMethod):
             fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None
         ), "w1_scale_bias and w2_scale_bias cannot be None for FusedMC2CommImpl."
 
+        if fused_experts_input.weights.w1_offset is not None or fused_experts_input.weights.w2_offset is not None:
+            raise NotImplementedError(
+                "FusedMC2CommImpl does not support AWQ int4 weights with antiquant offsets."
+            )
+
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )

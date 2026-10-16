@@ -312,6 +312,17 @@ class NPUWorker(WorkerBase):
         # Initialize device properties used by triton kernels.
         init_device_properties_triton()
 
+        # Diagnostic: force the default NPU stream/context to be valid before
+        # model profiling. In some spawn+HCCL scenarios the current ACL context
+        # is not bound to the worker thread when the first Triton kernel is
+        # launched, causing _npu_getCurrentRawStream to fail with ERR00100.
+        try:
+            torch.npu.synchronize()
+            logger.info("[AWQ_DIAG] post-init torch.npu.synchronize() succeeded on rank %s", self.rank)
+        except Exception as e:
+            logger.warning("[AWQ_DIAG] post-init torch.npu.synchronize() failed on rank %s: %s", self.rank, e)
+            raise
+
         return device
 
     def init_device(self):
@@ -340,6 +351,21 @@ class NPUWorker(WorkerBase):
         Then, it calculates the free memory that can be used for KV cache in
         bytes.
         """
+        # Diagnostic: try a tiny Triton kernel right before profile_run to see
+        # whether the NPU stream/context is still valid after model loading.
+        try:
+            import torch
+            from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
+            _x = torch.ones(4, 64, dtype=torch.bfloat16, device=self.device)
+            _w = torch.ones(64, dtype=torch.bfloat16, device=self.device)
+            _z = torch.ones(4, 64, dtype=torch.bfloat16, device=self.device)
+            _y, _, _ = layer_norm_fwd_npu(_x, _w, None, 1e-6, z=_z, group_size=64, norm_before_gate=True, is_rms_norm=True)
+            torch.npu.synchronize()
+            logger.info("[AWQ_DIAG] pre-profile_run Triton layernorm succeeded on rank %s", self.rank)
+        except Exception as e:
+            logger.warning("[AWQ_DIAG] pre-profile_run Triton layernorm failed on rank %s: %s", self.rank, e)
+            raise
+
         GiB = lambda b: b / GiB_bytes
 
         # Fast path: user has explicitly specified KV cache size via

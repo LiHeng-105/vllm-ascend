@@ -188,6 +188,7 @@ std::tuple<at::Tensor, at::Tensor> grouped_matmul_swiglu_quant_v2_meta(
 
     return std::tuple<at::Tensor, at::Tensor>(output, output_scale);
 }
+
 std::tuple<at::Tensor, at::Tensor> dispatch_gmm_combine_decode_meta(
     const at::Tensor &x,
     const at::Tensor &expert_ids,
@@ -1624,7 +1625,27 @@ void store_kv_block(
 {
     return;
 
-} 
+}
+
+at::Tensor grouped_matmul_swiglu_awq_meta(
+    const at::Tensor &x,
+    const at::Tensor &weight1,
+    const at::Tensor &weight1_scale,
+    const at::Tensor &weight1_offset,
+    const at::Tensor &weight2,
+    const at::Tensor &weight2_scale,
+    const at::Tensor &weight2_offset,
+    const at::Tensor &group_list,
+    int64_t group_list_type,
+    int64_t group_size,
+    double swiglu_limit)
+{
+    auto x_size = x.sizes();
+    int64_t m = x_size[0];
+    int64_t n2 = weight2_scale.sizes().back();
+    at::Tensor output = at::empty({m, n2}, x.options());
+    return output;
+}
 
 } // namespace meta
 } // namespace vllm_ascend
@@ -1673,6 +1694,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("grouped_matmul_swiglu_quant_weight_nz_tensor_list", &vllm_ascend::meta::grouped_matmul_swiglu_quant_weight_nz_tensor_list_meta);
     // Grouped matmul swiglu quant v2
     ops.impl("grouped_matmul_swiglu_quant_v2", &vllm_ascend::meta::grouped_matmul_swiglu_quant_v2_meta);
+    // Grouped matmul swiglu awq
+    ops.impl("grouped_matmul_swiglu_awq", &vllm_ascend::meta::grouped_matmul_swiglu_awq_meta);
     // dispatch_gmm_combine_decode meta implementation
     ops.impl("dispatch_gmm_combine_decode", &vllm_ascend::meta::dispatch_gmm_combine_decode_meta);
     // Lightning indexer

@@ -1650,10 +1650,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
         if self.fused_qkv_a_proj is not None:
-            weight_prefetch_method = get_weight_prefetch_method()
-            weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
-                inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
-            )
+            if hasattr(self.fused_qkv_a_proj, 'weight'):
+                weight_prefetch_method = get_weight_prefetch_method()
+                weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+                    inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
+                )
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -1789,13 +1790,14 @@ class AscendMLAImpl(MLAAttentionImpl):
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         # O proj
-        weight_prefetch_method = get_weight_prefetch_method()
-        weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
-            inputs=self.o_proj.weight,
-            dependency=o_proj_input,
-            max_size=MAX_O_PROJ_PREFETCH_SIZE,
-            linear_layer=self.o_proj,
-        )
+        if hasattr(self.o_proj, 'weight'):
+            weight_prefetch_method = get_weight_prefetch_method()
+            weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+                inputs=self.o_proj.weight,
+                dependency=o_proj_input,
+                max_size=MAX_O_PROJ_PREFETCH_SIZE,
+                linear_layer=self.o_proj,
+            )
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 
         del o_proj_input

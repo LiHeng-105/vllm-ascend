@@ -21,8 +21,9 @@ from enum import Enum
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -53,6 +54,7 @@ from vllm_ascend.attention.utils import (
     split_decodes_and_prefills,
     using_paged_attention,
 )
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
     get_draft_graph_prefill_params,
@@ -64,6 +66,21 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+
+try:
+    from vllm_ascend.ops.triton.attention.paged_decode import (
+        MAX_Q_PAD as _TRITON_MAX_Q_PAD,
+        paged_gqa_decode_attention as _paged_gqa_decode_attention,
+    )
+
+    _HAS_TRITON_DECODE_ATTN = True
+except ImportError:
+    _TRITON_MAX_Q_PAD = 16
+    _paged_gqa_decode_attention = None
+    _HAS_TRITON_DECODE_ATTN = False
+
+# KV split factor for the Triton paged decode attention stage-1 grid.
+_TRITON_DECODE_NUM_SPLITS = 4
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
@@ -181,6 +198,14 @@ class AscendMetadata:
     seq_lens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
 
+    # Device-side views of the runner's persistent metadata buffers.
+    # Unlike `seq_lens` (which mirrors the host-list based build path), these
+    # stay on the NPU with stable addresses across steps, so Triton decode
+    # attention kernels can read them directly inside a captured aclgraph.
+    # Contents are refreshed in place by the model runner before each step.
+    seq_lens_npu: torch.Tensor = None
+    query_start_loc_npu: torch.Tensor = None
+
     query_start_loc: torch.Tensor = None
     # Maximum query length in the batch (None for decoding).
     max_query_len: int | None = None
@@ -255,6 +280,17 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        # Persistent pinned staging (double-buffered so a slow stream can
+        # never make build N+1's host-side refill race build N's async H2D)
+        # for the per-build query_start_loc H2D. Reallocated (amortized
+        # rare) when a larger batch appears; avoids a pin_memory()
+        # allocation on every build.
+        self._qsl_staging_cap = 1024
+        self._qsl_staging = [
+            torch.empty(self._qsl_staging_cap, dtype=torch.int32, pin_memory=True)
+            for _ in range(2)
+        ]
+        self._qsl_flip = 0
 
     @classmethod
     def get_cudagraph_support(
@@ -307,8 +343,30 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # Get attn_mask from singleton AttentionMaskBuilder
         attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
 
-        # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        # H2D via persistent pinned staging: same values as before, but
+        # avoids a pin_memory() allocation per build.
+        n_qsl = num_reqs + 1
+        if n_qsl > self._qsl_staging_cap:
+            self._qsl_staging_cap = max(n_qsl, 2 * self._qsl_staging_cap)
+            self._qsl_staging = [
+                torch.empty(self._qsl_staging_cap, dtype=torch.int32, pin_memory=True)
+                for _ in range(2)
+            ]
+        staging = self._qsl_staging[self._qsl_flip]
+        self._qsl_flip ^= 1
+        staging[:n_qsl].copy_(query_start_loc_cpu)
+        query_start_loc = staging[:n_qsl].to(self.device, non_blocking=True)
+
+        # Device-side persistent views for the Triton decode attention path.
+        # These alias the runner's persistent buffers, whose contents are
+        # refreshed in place before every step, so they stay valid inside a
+        # captured aclgraph. Sliced from index 0 so the addresses are stable.
+        seq_lens_npu = None
+        query_start_loc_npu = None
+        if common_attn_metadata.seq_lens is not None and common_attn_metadata.seq_lens.is_npu:
+            seq_lens_npu = common_attn_metadata.seq_lens[:num_reqs]
+        if common_attn_metadata.query_start_loc is not None and common_attn_metadata.query_start_loc.is_npu:
+            query_start_loc_npu = common_attn_metadata.query_start_loc[: num_reqs + 1]
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -316,6 +374,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             block_tables=block_table,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
+            seq_lens_npu=seq_lens_npu,
+            query_start_loc_npu=query_start_loc_npu,
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens.tolist(),
             max_query_len=common_attn_metadata.max_query_len,
@@ -396,6 +456,66 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.sinks = sinks
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
+        self.use_triton_attn_decode = envs_ascend.VLLM_ASCEND_TRITON_ATTN
+
+    def _can_use_triton_decode_attn(self, attn_metadata: AscendMetadata) -> bool:
+        """Shape/feature gate for the Triton paged decode attention path.
+
+        Mirrors the causal-conv1d flag philosophy: only take over batches the
+        kernel implements exactly (causal paged GQA decode/spec shapes with
+        device metadata); everything else keeps the FIA path.
+        """
+        if not (self.use_triton_attn_decode and _HAS_TRITON_DECODE_ATTN):
+            return False
+        if self.sinks is not None or self.sliding_window is not None or self.alibi_slopes is not None:
+            return False
+        if self.attn_type != AttentionType.DECODER:
+            return False
+        if self.enable_hamming_sparse or self.enable_c8_quant:
+            return False
+        if attn_metadata is None or not attn_metadata.causal:
+            return False
+        # PrefillNoCache runs without a KV cache / block table.
+        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            return False
+        max_query_len = attn_metadata.max_query_len
+        if max_query_len is None or max_query_len < 1 or max_query_len > _TRITON_MAX_Q_PAD:
+            return False
+        if attn_metadata.seq_lens_npu is None or attn_metadata.query_start_loc_npu is None:
+            return False
+        if self.key_cache is None or self.key_cache.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        return True
+
+    def _forward_triton_decode_attention(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the Triton paged GQA decode kernel into `output` in place.
+
+        All metadata is read from device tensors, so this call can be captured
+        into an aclgraph directly and replays without any host-side parameter
+        refresh (no graph task params are registered for it).
+        """
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        _, _, num_kv_heads, _ = self.key_cache.shape
+        _paged_gqa_decode_attention(
+            query=query[:num_tokens],
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            block_table=attn_metadata.block_tables,
+            seq_lens=attn_metadata.seq_lens_npu,
+            query_start_loc=attn_metadata.query_start_loc_npu,
+            output=output[:num_tokens],
+            scale=self.scale,
+            num_heads=self.num_heads,
+            num_kv_heads=num_kv_heads,
+            max_query_len=attn_metadata.max_query_len,
+            num_splits=_TRITON_DECODE_NUM_SPLITS,
+        )
+        return output
 
     @staticmethod
     def update_graph_params(
@@ -1054,7 +1174,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
+        # Triton paged decode attention takes over decode/spec-shaped batches
+        # (small uniform query length, causal paged GQA, device metadata).
+        # The PIECEWISE gate mirrors the causal-conv1d flag: Triton kernels
+        # deadlock inside PIECEWISE graph capture when num_speculative_tokens
+        # >= 2, so PIECEWISE keeps the proven FIA path.
+        use_triton_attn = self._can_use_triton_decode_attn(attn_metadata) and (
+            get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+        )
         if _EXTRA_CTX.capturing:
+            if use_triton_attn:
+                # The kernel is captured into the aclgraph as-is (all metadata
+                # is device-side); no graph task group is registered, so the
+                # per-step update loop has nothing to refresh for this layer.
+                return self._forward_triton_decode_attention(query, attn_metadata, output)
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
@@ -1063,6 +1196,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
+        if use_triton_attn:
+            return self._forward_triton_decode_attention(query, attn_metadata, output)
         passed_key = key
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache

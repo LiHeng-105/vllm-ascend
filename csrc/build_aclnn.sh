@@ -87,6 +87,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "scatter_nd_update_v2"
         "moe_grouped_matmul"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
+        "grouped_matmul_swiglu_awq"
         "lightning_indexer"
         "sparse_flash_attention"
         "matmul_allreduce_add_rmsnorm"
@@ -147,6 +148,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     CUSTOM_OPS_ARRAY=(
         "scatter_nd_update_v2"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
+        "grouped_matmul_swiglu_awq"
         "lightning_indexer"
         "sparse_flash_attention"
         "dispatch_ffn_combine"

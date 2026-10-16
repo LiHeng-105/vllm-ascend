@@ -422,7 +422,13 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         is_group = weight_quant.strategy == QuantizationStrategy.GROUP.value
         is_static = not weight_quant.dynamic
 
-        return input_quant_none and is_4_bits and is_group and is_static
+        if input_quant_none and is_4_bits and is_group and is_static:
+            # Record group_size for the Ascend W4A16 linear scheme.
+            assert self.quant_description is not None, "quant_description should not be None"
+            self.quant_description["group_size"] = weight_quant.group_size if weight_quant.group_size else 0
+            return True
+
+        return False
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         self.target_scheme_map = hf_to_vllm_mapper.apply_dict(self.target_scheme_map)

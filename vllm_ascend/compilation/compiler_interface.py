@@ -185,18 +185,33 @@ def npugraph_ex_compile(
         nfx._NpuFxCompiler._get_compiled_gm = _original_get_compiled_gm
         return compiled_fn, (key, cache_path)
     except ImportError:
-        import torchair
+        pass
+    except (ValueError, AttributeError) as e:
+        # Older torch_npu/npugraph_ex builds lack options used by newer code
+        # (e.g. enable_view_optimize).  Restore the original compiler method and
+        # fall back to torchair instead of failing initialization.
+        logger.warning(
+            "npugraph_ex compilation is not usable with the installed torch_npu "
+            "(%s). Falling back to torchair.",
+            e,
+        )
+        try:
+            nfx._NpuFxCompiler._get_compiled_gm = _original_get_compiled_gm
+        except NameError:
+            pass
 
-        torch.npu.set_compile_mode(jit_compile=False)
-        config = torchair.CompilerConfig()
-        _configure_backend(config, ascend_compilation_config, vllm_config)
-        backend = torchair.get_npu_backend(compiler_config=config)
-        # torch.compile requires the output of the fx graph to be a tuple
-        if not graph_returns_tuple(graph):
-            compiled_fn = make_graph_return_tuple(graph, example_inputs, backend)
-        else:
-            compiled_fn = backend(graph, example_inputs)
-        return compiled_fn, None
+    import torchair
+
+    torch.npu.set_compile_mode(jit_compile=False)
+    config = torchair.CompilerConfig()
+    _configure_backend(config, ascend_compilation_config, vllm_config)
+    backend = torchair.get_npu_backend(compiler_config=config)
+    # torch.compile requires the output of the fx graph to be a tuple
+    if not graph_returns_tuple(graph):
+        compiled_fn = make_graph_return_tuple(graph, example_inputs, backend)
+    else:
+        compiled_fn = backend(graph, example_inputs)
+    return compiled_fn, None
 
 
 class AscendCompiler(CompilerInterface):

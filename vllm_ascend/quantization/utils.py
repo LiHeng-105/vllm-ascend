@@ -23,6 +23,7 @@ from vllm.logger import logger
 
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
+    AWQ_QUANTIZATION_METHOD,
     COMPRESSED_TENSORS_METHOD,
     FP8_METHOD,
     AscendDeviceType,
@@ -97,8 +98,12 @@ def detect_quantization_method(model: str, revision: str | None = None) -> str |
         2. **LLM-Compressor (compressed-tensors)** – ``config.json`` contains
            a ``quantization_config`` section with
            ``"quant_method": "compressed-tensors"``.
-        3. **None** – neither condition is met; the caller should fall back to
-           the default (float) behaviour.
+        3. **FP8** – ``config.json`` contains a ``quantization_config``
+           section with ``"quant_method": "fp8"``.
+        4. **AWQ** – ``config.json`` contains a ``quantization_config``
+           section with ``"quant_method": "awq"``.
+        5. **None** – none of the above conditions is met; the caller should
+           fall back to the default (float) behaviour.
 
     Args:
         model: Local directory path **or** HuggingFace / ModelScope repo id.
@@ -107,6 +112,8 @@ def detect_quantization_method(model: str, revision: str | None = None) -> str |
     Returns:
         ``"ascend"`` for ModelSlim models,
         ``"compressed-tensors"`` for LLM-Compressor models,
+        ``"fp8"`` for FP8 models,
+        ``"awq"`` for AWQ models,
         or ``None`` if no quantization signature is found.
     """
     from vllm_ascend.quantization.modelslim_config import MODELSLIM_CONFIG_FILENAME
@@ -116,7 +123,7 @@ def detect_quantization_method(model: str, revision: str | None = None) -> str |
     if modelslim_path is not None:
         return ASCEND_QUANTIZATION_METHOD
 
-    # Case 2: LLM-Compressor — look for compressed-tensors in config.json
+    # Case 2: LLM-Compressor / FP8 / AWQ — look in config.json
     config_path = get_model_file(model, "config.json", revision=revision)
     if config_path is not None:
         try:
@@ -127,10 +134,10 @@ def detect_quantization_method(model: str, revision: str | None = None) -> str |
                 quant_method = quant_cfg.get("quant_method", "")
                 if quant_method == COMPRESSED_TENSORS_METHOD:
                     return COMPRESSED_TENSORS_METHOD
-            if isinstance(quant_cfg, dict):
-                quant_method = quant_cfg.get("quant_method", "")
                 if quant_method == FP8_METHOD:
                     return FP8_METHOD
+                if quant_method == AWQ_QUANTIZATION_METHOD:
+                    return AWQ_QUANTIZATION_METHOD
         except (json.JSONDecodeError, OSError):
             pass
 

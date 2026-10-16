@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 
 
+import os
 import torch
 import torch_npu
 from torch.nn.functional import pad
@@ -223,34 +224,83 @@ def quant_apply_mlp(
             mxfp_quant_dtype=mxfp_quant_dtype,
         )
     elif w1_offset is not None:
-        # gmm1: gate_up_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[unquantized_hidden_states],
-            weight=[w1],
-            antiquant_scale=[w1_scale],
-            antiquant_offset=[w1_offset],
-            split_item=2,
-            group_list_type=group_list_type,
-            group_type=0,
-            group_list=group_list,
-            output_dtype=_output_dtype,
-        )[0]
-        dispose_tensor(unquantized_hidden_states)
-        # act_fn: swiglu
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
-        before_gmm2_evt = torch.npu.current_stream().record_event()
-        # gmm2: down_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[w2],
-            antiquant_scale=[w2_scale],
-            antiquant_offset=[w2_offset],
-            split_item=2,
-            group_list_type=group_list_type,
-            group_type=0,
-            group_list=group_list,
-            output_dtype=_output_dtype,
-        )[0]
+        # AWQ W4A16 path: activations stay in FP16/BF16, weights are int4 and are
+        # dequantized inside npu_grouped_matmul via antiquant_scale/offset.
+        # The Ascend token dispatcher already produces a per-expert count list
+        # (group_list_type=1); keep it instead of converting to a cumsum list to
+        # avoid an extra synchronization/kernel per MoE layer.
+        awq_scale_dtype = input_hidden_dtype if input_hidden_dtype == torch.bfloat16 else torch.float32
+        awq_group_list = group_list
+        awq_group_list_type = group_list_type
+
+        # NOTE(liheng): The custom fused AWQ kernel currently dequantizes int4
+        # weights on AIV and then runs fp16 matmul on AIC.  Profiling shows this
+        # is ~3700x slower than the built-in torch_npu.npu_grouped_matmul path
+        # (which does antiquant+matmul on AIC).  Default to the optimized unfused
+        # path; set VLLM_ASCEND_USE_FUSED_AWQ=1 to re-enable the custom kernel.
+        use_fused_awq = (os.environ.get("VLLM_ASCEND_USE_FUSED_AWQ", "0") == "1") and \
+                        enable_custom_op() and hasattr(torch.ops._C_ascend, "grouped_matmul_swiglu_awq")
+        if use_fused_awq:
+            # Fused AWQ MoE path: single custom op for gate_up gmm + swiglu + down gmm.
+            # The kernel keeps int4 weight packed in global memory and dequantizes
+            # per-tile inside the kernel workspace, so host-side memory does not double.
+            try:
+                group_size = w1.size(1) // w1_scale.size(1)
+                # The custom op expects all expert weights/scales/offsets to be
+                # stacked along the leading dimension as contiguous packed tensors.
+                fused_awq_scale_dtype = input_hidden_dtype
+                awq_fused_group_list = cumsum_group_list(group_list, group_list_type, 0)
+                hidden_states = torch.ops._C_ascend.grouped_matmul_swiglu_awq(
+                    unquantized_hidden_states,
+                    w1.contiguous(),
+                    w1_scale.to(fused_awq_scale_dtype).contiguous(),
+                    w1_offset.to(fused_awq_scale_dtype).contiguous(),
+                    w2.contiguous(),
+                    w2_scale.to(fused_awq_scale_dtype).contiguous(),
+                    w2_offset.to(fused_awq_scale_dtype).contiguous(),
+                    awq_fused_group_list,
+                    group_list_type=0,
+                    group_size=group_size,
+                    swiglu_limit=swiglu_limit,
+                )
+                dispose_tensor(unquantized_hidden_states)
+                before_gmm2_evt = torch.npu.current_stream().record_event()
+            except Exception as e:
+                # If the fused kernel is unavailable or fails, fall back to the
+                # proven split-kernel path so serving is not broken.
+                use_fused_awq = False
+                # Continue to the fallback below.
+
+        if not use_fused_awq:
+            # gmm1: gate_up_proj
+            hidden_states = torch_npu.npu_grouped_matmul(
+                x=[unquantized_hidden_states],
+                weight=[w1],
+                antiquant_scale=[w1_scale.to(awq_scale_dtype)],
+                antiquant_offset=[w1_offset],
+                split_item=2,
+                group_list_type=awq_group_list_type,
+                group_type=0,
+                group_list=awq_group_list,
+                output_dtype=input_hidden_dtype,
+            )[0]
+            dispose_tensor(unquantized_hidden_states)
+            # act_fn: swiglu
+            hidden_states = torch_npu.npu_swiglu(hidden_states)
+            before_gmm2_evt = torch.npu.current_stream().record_event()
+            # gmm2: down_proj
+            hidden_states = torch_npu.npu_grouped_matmul(
+                x=[hidden_states],
+                weight=[w2],
+                antiquant_scale=[w2_scale.to(awq_scale_dtype)],
+                antiquant_offset=[w2_offset],
+                split_item=2,
+                group_list_type=awq_group_list_type,
+                group_type=0,
+                group_list=awq_group_list,
+                output_dtype=input_hidden_dtype,
+            )[0]
+        # TODO: Once the fused AWQ MoE kernel is mature, remove the fallback above.
     else:
         if w1_scale_bias is not None:
             if group_list_type == 0:

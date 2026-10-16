@@ -28,7 +28,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
-from .base import AscendMoEScheme, QuantType, get_moe_num_logical_experts
+from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
 
 
@@ -106,6 +106,101 @@ def pack_to_int32(weight: torch.Tensor) -> torch.Tensor:
         packed_weight = weight.view(torch.int32).contiguous()
 
     return packed_weight
+
+
+@register_scheme("W4A16", "linear")
+class AscendW4A16LinearMethod(AscendLinearScheme):
+    """Linear method for Ascend W4A16 (compressed-tensors int4 weight-only).
+
+    This scheme supports LLM-Compressor / compressed-tensors checkpoints that
+    store int4 weights in ``weight_packed`` (``torch.int32``) with group-wise
+    ``weight_scale`` (``torch.bfloat16``), such as the ``ocr-v3.1-2b-qat``
+    family. After loading, the packed weights are converted from the checkpoint
+    layout ``[N, K // 8]`` to the Ascend kernel layout ``[K, N // 8]``.
+    """
+
+    def __init__(self) -> None:
+        self.num_bits = 4
+        self.pack_factor = 8
+        vllm_config = get_current_vllm_config()
+        self.group_size = vllm_config.quant_config.quant_description.get(
+            "group_size", 32)
+
+    def get_weight(
+        self,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        params_dict = {
+            "weight_packed": torch.empty(
+                output_size, input_size // self.pack_factor, dtype=torch.int32),
+            "_packed_dim": 1,
+            "_packed_factor": self.pack_factor,
+        }
+        return params_dict
+
+    def get_pergroup_param(
+        self,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        layer_type: str | None = None,
+    ) -> dict[str, Any]:
+        num_groups = input_size // self.group_size
+        params_dict = {
+            "weight_scale": torch.empty(
+                output_size, num_groups, dtype=params_dtype),
+            "weight_offset": torch.zeros(
+                output_size, num_groups, dtype=params_dtype),
+        }
+        return params_dict
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        tp_rank: int | None = 0,
+    ) -> torch.Tensor:
+        out_shape = x.shape[:-1] + (layer.weight_packed.shape[-1] *
+                                    self.pack_factor, )
+        reshaped_x = x.reshape(-1, x.shape[-1])
+
+        if bias is not None and bias.dtype == torch.bfloat16:
+            bias = bias.float()
+
+        out = torch_npu.npu_weight_quant_batchmatmul(
+            x=reshaped_x,
+            weight=layer.weight_packed,
+            antiquant_scale=layer.weight_scale,
+            antiquant_offset=layer.weight_offset,
+            antiquant_group_size=self.group_size,
+            bias=bias,
+        )
+        return out.reshape(out_shape)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        packed_shape = layer.weight_packed.data.shape
+        # Checkpoint layout: [N, K // pack_factor]. Unpack to [N, K] signed int8.
+        unpacked_weight = unpack_from_int32(
+            layer.weight_packed.data,
+            torch.Size([packed_shape[0], packed_shape[1] * self.pack_factor]),
+            self.num_bits,
+            packed_dim=1,
+        )
+        # Transpose to [K, N] and repack to [K, N // pack_factor] int32.
+        unpacked_weight = unpacked_weight.transpose(0, 1).contiguous().to(
+            torch.int32)
+        layer.weight_packed.data = torch_npu.npu_convert_weight_to_int4pack(
+            unpacked_weight)
+
+        # Scale/offset checkpoint layout: [N, K // group_size]; kernel expects
+        # [K // group_size, N].
+        layer.weight_scale.data = layer.weight_scale.data.transpose(
+            0, 1).contiguous()
+        layer.weight_offset.data = layer.weight_offset.data.transpose(
+            0, 1).contiguous()
 
 
 @register_scheme("W4A16", "moe")

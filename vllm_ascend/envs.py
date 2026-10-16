@@ -110,6 +110,36 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to use the Triton causal-conv1d update kernel for the GDN linear
+    # attention decode/speculative paths instead of aclnnCausalConv1d with
+    # per-step graph_task_update of host-side parameters. The Triton kernel
+    # takes device-side metadata, so it is captured into the aclgraph directly
+    # and needs no host parameter refresh between decode steps.
+    # 0 (default): keep the aclnnCausalConv1d + graph_task_update path.
+    # 1: use the Triton causal_conv1d_update_npu kernel (requires Triton / 910B).
+    "VLLM_ASCEND_GDN_TRITON_CONV": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_TRITON_CONV", "0"))),
+    # Whether to use the Triton paged GQA decode attention kernel for the
+    # full-attention decode/speculative paths instead of
+    # npu_fused_infer_attention_score. The Triton kernel reads all metadata
+    # (seq_lens, query_start_loc, block_table) from device tensors, so it is
+    # captured into the aclgraph directly and no FIA graph task params are
+    # registered, eliminating the per-step FIA graph_task_update chain.
+    # Only applies when cudagraph_runtime_mode != PIECEWISE (Triton kernels
+    # deadlock in PIECEWISE capture with num_speculative_tokens >= 2) and to
+    # causal decode-shaped batches (max_query_len <= 16, no sliding window /
+    # sinks / alibi / sparse / c8-quant). Everything else falls back to FIA.
+    # 0 (default): keep the FIA path.
+    # 1: use the Triton paged decode attention kernel (requires Triton / 910B).
+    "VLLM_ASCEND_TRITON_ATTN": lambda: bool(int(os.getenv("VLLM_ASCEND_TRITON_ATTN", "0"))),
+    # Fused TP vocab-shard masking (VocabParallelEmbedding._get_masked_input_and_mask)
+    # as a single Triton kernel instead of ~7 pointwise eager kernels whose
+    # cost is host dispatch. Runs on every embedding lookup and every lm_head
+    # projection (several times per decode step with MTP). Bit-exact integer
+    # arithmetic with the eager formulation; falls back when Triton is missing
+    # or the input is not a contiguous 1-D NPU int64 tensor.
+    # 0 (default): keep the eager path.
+    # 1: use the fused Triton vocab mask kernel (requires Triton / 910B).
+    "VLLM_ASCEND_TRITON_VOCAB_MASK": lambda: bool(int(os.getenv("VLLM_ASCEND_TRITON_VOCAB_MASK", "0"))),
 }
 
 # end-env-vars-definition

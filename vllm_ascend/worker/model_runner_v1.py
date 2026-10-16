@@ -1262,10 +1262,29 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
-            drift = self.num_computed_tokens[req_indices_gpu].to(
-                torch.int64
-            ) - self.input_batch.num_computed_tokens_cpu_tensor[req_indices].to(
-                device=self.device, dtype=torch.int64, non_blocking=True
+            # Semantics identical to the original formulation: gather the
+            # GPU-corrected counts, subtract the optimistic CPU counts,
+            # and add the drift into the (int64) position buffer. The CPU
+            # side goes through pinned double-buffer staging (instead of a
+            # pageable .to(device)) and everything stays int32; the
+            # in-place += promotes to the position buffer's int64, so the
+            # two per-step cast kernels are dropped.
+            cpu_vals = self.input_batch.num_computed_tokens_cpu_tensor[req_indices]
+            n_vals = cpu_vals.numel()
+            staging = getattr(self, "_drift_staging", None)
+            if staging is None or staging[0].numel() < n_vals:
+                cap = max(n_vals, 1024)
+                staging = [
+                    torch.empty(cap, dtype=torch.int32, pin_memory=True)
+                    for _ in range(2)
+                ]
+                self._drift_staging = staging
+                self._drift_staging_flip = 0
+            buf = staging[self._drift_staging_flip]
+            self._drift_staging_flip ^= 1
+            buf[:n_vals].copy_(cpu_vals)
+            drift = self.num_computed_tokens[req_indices_gpu] - buf[:n_vals].to(
+                self.device, non_blocking=True
             )
             target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
             target.gpu[:, :total_num_scheduled_tokens] += drift

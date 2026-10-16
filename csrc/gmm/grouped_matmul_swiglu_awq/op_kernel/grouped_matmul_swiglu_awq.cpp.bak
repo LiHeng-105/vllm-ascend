@@ -1,0 +1,439 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file grouped_matmul_swiglu_awq.cpp
+ * \brief Kernel entry and template implementation for grouped_matmul_swiglu_awq.
+ *
+ * Schedule (MIX_AIC_1_2, one AIC + two AIV per block):
+ *   For each expert group g:
+ *     AIV sub-block 0 dequantizes weight1 -> workspace w1_deq
+ *     sync
+ *     AIC computes x @ w1_deq -> workspace gate_up
+ *     sync
+ *     AIV computes SwiGLU(gate_up) -> workspace inter
+ *     AIV sub-block 0 dequantizes weight2 -> workspace w2_deq
+ *     sync
+ *     AIC computes inter @ w2_deq -> output y
+ *     sync
+ */
+
+#include "grouped_matmul_swiglu_awq.h"
+#include "kernel_tiling/kernel_tiling.h"
+
+using namespace AscendC;
+
+template <typename T>
+__aicore__ inline void KernelGroupedMatmulSwigluAwq<T>::Init(GM_ADDR x,
+                                                              GM_ADDR weight1, GM_ADDR weight1_scale, GM_ADDR weight1_offset,
+                                                              GM_ADDR weight2, GM_ADDR weight2_scale, GM_ADDR weight2_offset,
+                                                              GM_ADDR group_list,
+                                                              GM_ADDR y, GM_ADDR workspace,
+                                                              const optiling::GroupedMatmulSwigluAwqTilingData *tiling)
+{
+    tiling_ = tiling;
+    block_idx_ = GetBlockIdx();
+    sub_block_idx_ = GetSubBlockIdx();
+    swiglu_limit_ = tiling->swiglu_limit;
+
+    x_gm_.SetGlobalBuffer((__gm__ T *)x);
+    group_list_gm_.SetGlobalBuffer((__gm__ int64_t *)group_list);
+    y_gm_.SetGlobalBuffer((__gm__ T *)y);
+
+    weight1_list_.Init((__gm__ void *)weight1);
+    weight1_scale_list_.Init((__gm__ void *)weight1_scale);
+    weight1_offset_list_.Init((__gm__ void *)weight1_offset);
+    weight2_list_.Init((__gm__ void *)weight2);
+    weight2_scale_list_.Init((__gm__ void *)weight2_scale);
+    weight2_offset_list_.Init((__gm__ void *)weight2_offset);
+
+    GM_ADDR user_workspace = GetUserWorkspace(workspace);
+    uint64_t per_block = tiling->per_block_workspace;
+    __gm__ uint8_t *base_ptr = (__gm__ uint8_t *)user_workspace +
+                               static_cast<uint64_t>(block_idx_) * per_block;
+
+    uint64_t w1_off = 0;
+    uint64_t gate_up_off = (tiling->w1_deq_size + 63ULL) & ~63ULL;
+    uint64_t inter_off = gate_up_off + ((tiling->gate_up_size + 63ULL) & ~63ULL);
+    uint64_t w2_off = inter_off + ((tiling->inter_size + 63ULL) & ~63ULL);
+
+    w1_deq_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(base_ptr + w1_off));
+    gate_up_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(base_ptr + gate_up_off));
+    inter_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(base_ptr + inter_off));
+    w2_deq_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(base_ptr + w2_off));
+
+    if ASCEND_IS_AIV {
+        pipe_->InitBuffer(in_queue_, 1, tiling->n1 * sizeof(T));
+        pipe_->InitBuffer(out_queue_, 1, (tiling->n1 / 2) * sizeof(T));
+        pipe_->InitBuffer(calc_buf_, static_cast<uint32_t>((tiling->n1 * 3 / 2) * sizeof(float)));
+        // deq_buf_ layout: packed(int32) | scale(T) | offset(T) | scale_f(float) | offset_f(float) | ftmp(float) | ttmp(T)
+        uint32_t deq_bytes = (kDeqTileN / 8) * sizeof(int32_t) + 2 * kDeqTileN * sizeof(T) +
+                             2 * kDeqTileN * sizeof(float) + kDeqTileN * sizeof(float) + kDeqTileN * sizeof(T);
+        pipe_->InitBuffer(deq_buf_, deq_bytes);
+    }
+    if ASCEND_IS_AIC {
+        mm1_.SetSubBlockIdx(0);
+        mm2_.SetSubBlockIdx(0);
+        mm1_.Init(&tiling->mm_tiling1, pipe_);
+        mm2_.Init(&tiling->mm_tiling2, pipe_);
+    }
+}
+
+template <typename T>
+__aicore__ inline void KernelGroupedMatmulSwigluAwq<T>::DequantWeight1(uint32_t group_idx, GlobalTensor<T> &out)
+{
+    __gm__ int32_t *w_ptr = weight1_list_.GetDataPtr<int32_t>(group_idx);
+    __gm__ int32_t *s_ptr = weight1_scale_list_.GetDataPtr<int32_t>(group_idx);
+    __gm__ int32_t *z_ptr = weight1_offset_list_.GetDataPtr<int32_t>(group_idx);
+    GlobalTensor<int32_t> w_gm;
+    GlobalTensor<T> s_gm;
+    GlobalTensor<T> z_gm;
+    w_gm.SetGlobalBuffer(w_ptr);
+    s_gm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(s_ptr));
+    z_gm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(z_ptr));
+
+    uint32_t k = tiling_->k;
+    uint32_t n = tiling_->n1;
+    uint32_t n_packed = n / 8;
+    uint32_t group_size = tiling_->group_size;
+    uint32_t packed_tile_n = kDeqTileN / 8;
+
+    // Layout inside deq_buf_: packed | scale_t | offset_t | scale_f | offset_f | ftmp | ttmp.
+    uint32_t scale_t_off = packed_tile_n * sizeof(int32_t);
+    uint32_t offset_t_off = scale_t_off + kDeqTileN * sizeof(T);
+    uint32_t scale_f_off = offset_t_off + kDeqTileN * sizeof(T);
+    uint32_t offset_f_off = scale_f_off + kDeqTileN * sizeof(float);
+    uint32_t ftmp_off = offset_f_off + kDeqTileN * sizeof(float);
+    uint32_t ttmp_off = ftmp_off + kDeqTileN * sizeof(float);
+
+    LocalTensor<int32_t> packed = deq_buf_.Get<int32_t>(packed_tile_n);
+    LocalTensor<T> scale_t = deq_buf_.GetWithOffset<T>(kDeqTileN, scale_t_off);
+    LocalTensor<T> offset_t = deq_buf_.GetWithOffset<T>(kDeqTileN, offset_t_off);
+    LocalTensor<float> scale_f = deq_buf_.GetWithOffset<float>(kDeqTileN, scale_f_off);
+    LocalTensor<float> offset_f = deq_buf_.GetWithOffset<float>(kDeqTileN, offset_f_off);
+    LocalTensor<float> ftmp = deq_buf_.GetWithOffset<float>(kDeqTileN, ftmp_off);
+    LocalTensor<T> ttmp = deq_buf_.GetWithOffset<T>(kDeqTileN, ttmp_off);
+
+    for (uint32_t kk = 0; kk < k; ++kk) {
+        uint32_t g = kk / group_size;
+        for (uint32_t nn = 0; nn < n; nn += kDeqTileN) {
+            uint32_t tile = (nn + kDeqTileN <= n) ? kDeqTileN : (n - nn);
+            uint32_t packed_count = (tile + 7) / 8;
+
+            DataCopyExtParams copy_packed{1, static_cast<uint32_t>(packed_count * sizeof(int32_t)), 0, 0, 0};
+            DataCopyPadExtParams<int32_t> pad_packed{false, 0, 0, 0};
+            DataCopyPad(packed, w_gm[static_cast<uint64_t>(kk) * n_packed + nn / 8], copy_packed, pad_packed);
+            PipeBarrier<PIPE_V>();
+
+            DataCopyExtParams copy_sz{1, static_cast<uint32_t>(tile * sizeof(T)), 0, 0, 0};
+            DataCopyPadExtParams<T> pad_sz{false, 0, 0, 0};
+            DataCopyPad(scale_t, s_gm[static_cast<uint64_t>(g) * n + nn], copy_sz, pad_sz);
+            PipeBarrier<PIPE_V>();
+            DataCopyPad(offset_t, z_gm[static_cast<uint64_t>(g) * n + nn], copy_sz, pad_sz);
+            PipeBarrier<PIPE_V>();
+
+            Cast(scale_f, scale_t, RoundMode::CAST_NONE, tile);
+            PipeBarrier<PIPE_V>();
+            Cast(offset_f, offset_t, RoundMode::CAST_NONE, tile);
+            PipeBarrier<PIPE_V>();
+
+            for (uint32_t i = 0; i < tile; ++i) {
+                uint32_t col = nn + i;
+                int32_t packed_val = packed.GetValue(i / 8);
+                int32_t nibble = (packed_val >> (4 * (col % 8))) & 0xF;
+                int8_t iv = Int4ToInt8(nibble);
+                ftmp.SetValue(i, (static_cast<float>(iv) + offset_f.GetValue(i)) * scale_f.GetValue(i));
+            }
+            Cast(ttmp, ftmp, RoundMode::CAST_RINT, tile);
+            PipeBarrier<PIPE_V>();
+            DataCopyExtParams copy_params{1, static_cast<uint32_t>(tile * sizeof(T)), 0, 0, 0};
+            DataCopyPad(out[static_cast<uint64_t>(kk) * n + nn], ttmp, copy_params);
+        }
+    }
+    PipeBarrier<PIPE_ALL>();
+}
+
+template <typename T>
+__aicore__ inline void KernelGroupedMatmulSwigluAwq<T>::DequantWeight2(uint32_t group_idx, GlobalTensor<T> &out)
+{
+    __gm__ int32_t *w_ptr = weight2_list_.GetDataPtr<int32_t>(group_idx);
+    __gm__ int32_t *s_ptr = weight2_scale_list_.GetDataPtr<int32_t>(group_idx);
+    __gm__ int32_t *z_ptr = weight2_offset_list_.GetDataPtr<int32_t>(group_idx);
+    GlobalTensor<int32_t> w_gm;
+    GlobalTensor<T> s_gm;
+    GlobalTensor<T> z_gm;
+    w_gm.SetGlobalBuffer(w_ptr);
+    s_gm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(s_ptr));
+    z_gm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(z_ptr));
+
+    uint32_t k = tiling_->n1 / 2;
+    uint32_t n = tiling_->n2;
+    uint32_t n_packed = n / 8;
+    uint32_t group_size = tiling_->group_size;
+    uint32_t packed_tile_n = kDeqTileN / 8;
+
+    // Layout inside deq_buf_: packed | scale_t | offset_t | scale_f | offset_f | ftmp | ttmp.
+    uint32_t scale_t_off = packed_tile_n * sizeof(int32_t);
+    uint32_t offset_t_off = scale_t_off + kDeqTileN * sizeof(T);
+    uint32_t scale_f_off = offset_t_off + kDeqTileN * sizeof(T);
+    uint32_t offset_f_off = scale_f_off + kDeqTileN * sizeof(float);
+    uint32_t ftmp_off = offset_f_off + kDeqTileN * sizeof(float);
+    uint32_t ttmp_off = ftmp_off + kDeqTileN * sizeof(float);
+
+    LocalTensor<int32_t> packed = deq_buf_.Get<int32_t>(packed_tile_n);
+    LocalTensor<T> scale_t = deq_buf_.GetWithOffset<T>(kDeqTileN, scale_t_off);
+    LocalTensor<T> offset_t = deq_buf_.GetWithOffset<T>(kDeqTileN, offset_t_off);
+    LocalTensor<float> scale_f = deq_buf_.GetWithOffset<float>(kDeqTileN, scale_f_off);
+    LocalTensor<float> offset_f = deq_buf_.GetWithOffset<float>(kDeqTileN, offset_f_off);
+    LocalTensor<float> ftmp = deq_buf_.GetWithOffset<float>(kDeqTileN, ftmp_off);
+    LocalTensor<T> ttmp = deq_buf_.GetWithOffset<T>(kDeqTileN, ttmp_off);
+
+    for (uint32_t kk = 0; kk < k; ++kk) {
+        uint32_t g = kk / group_size;
+        for (uint32_t nn = 0; nn < n; nn += kDeqTileN) {
+            uint32_t tile = (nn + kDeqTileN <= n) ? kDeqTileN : (n - nn);
+            uint32_t packed_count = (tile + 7) / 8;
+
+            DataCopyExtParams copy_packed{1, static_cast<uint32_t>(packed_count * sizeof(int32_t)), 0, 0, 0};
+            DataCopyPadExtParams<int32_t> pad_packed{false, 0, 0, 0};
+            DataCopyPad(packed, w_gm[static_cast<uint64_t>(kk) * n_packed + nn / 8], copy_packed, pad_packed);
+            PipeBarrier<PIPE_V>();
+
+            DataCopyExtParams copy_sz{1, static_cast<uint32_t>(tile * sizeof(T)), 0, 0, 0};
+            DataCopyPadExtParams<T> pad_sz{false, 0, 0, 0};
+            DataCopyPad(scale_t, s_gm[static_cast<uint64_t>(g) * n + nn], copy_sz, pad_sz);
+            PipeBarrier<PIPE_V>();
+            DataCopyPad(offset_t, z_gm[static_cast<uint64_t>(g) * n + nn], copy_sz, pad_sz);
+            PipeBarrier<PIPE_V>();
+
+            Cast(scale_f, scale_t, RoundMode::CAST_NONE, tile);
+            PipeBarrier<PIPE_V>();
+            Cast(offset_f, offset_t, RoundMode::CAST_NONE, tile);
+            PipeBarrier<PIPE_V>();
+
+            for (uint32_t i = 0; i < tile; ++i) {
+                uint32_t col = nn + i;
+                int32_t packed_val = packed.GetValue(i / 8);
+                int32_t nibble = (packed_val >> (4 * (col % 8))) & 0xF;
+                int8_t iv = Int4ToInt8(nibble);
+                ftmp.SetValue(i, (static_cast<float>(iv) + offset_f.GetValue(i)) * scale_f.GetValue(i));
+            }
+            Cast(ttmp, ftmp, RoundMode::CAST_RINT, tile);
+            PipeBarrier<PIPE_V>();
+            DataCopyExtParams copy_params{1, static_cast<uint32_t>(tile * sizeof(T)), 0, 0, 0};
+            DataCopyPad(out[static_cast<uint64_t>(kk) * n + nn], ttmp, copy_params);
+        }
+    }
+    PipeBarrier<PIPE_ALL>();
+}
+
+template <typename T>
+__aicore__ inline void KernelGroupedMatmulSwigluAwq<T>::SwigluRow(uint32_t row)
+{
+    uint32_t n1 = tiling_->n1;
+    uint32_t half_n = n1 / 2;
+
+    LocalTensor<T> in_local = in_queue_.AllocTensor<T>();
+    DataCopyExtParams copy_in{1, static_cast<uint32_t>(n1 * sizeof(T)), 0, 0, 0};
+    DataCopyPadExtParams<T> pad_params{false, 0, 0, 0};
+    DataCopyPad(in_local, gate_up_gm_[static_cast<uint64_t>(row) * n1], copy_in, pad_params);
+    PipeBarrier<PIPE_V>();
+
+    LocalTensor<float> in_float = calc_buf_.Get<float>();
+    Cast(in_float, in_local, RoundMode::CAST_NONE, n1);
+    PipeBarrier<PIPE_V>();
+
+    if (swiglu_limit_ > 0.0f) {
+        Mins(in_float, in_float, swiglu_limit_, n1);
+        PipeBarrier<PIPE_V>();
+        Maxs(in_float, in_float, -swiglu_limit_, n1);
+        PipeBarrier<PIPE_V>();
+    }
+
+    LocalTensor<float> gate = in_float;
+    LocalTensor<float> up = in_float[half_n];
+    LocalTensor<float> dst = calc_buf_.GetWithOffset<float>(half_n, n1 * sizeof(float));
+    SwiGLU<float, false>(dst, gate, up, 1.0f, half_n);
+    PipeBarrier<PIPE_V>();
+
+    LocalTensor<T> out_local = out_queue_.AllocTensor<T>();
+    Cast(out_local, dst, RoundMode::CAST_RINT, half_n);
+    PipeBarrier<PIPE_V>();
+
+    DataCopyExtParams copy_out{1, static_cast<uint32_t>(half_n * sizeof(T)), 0, 0, 0};
+    DataCopyPad(inter_gm_[static_cast<uint64_t>(row) * half_n], out_local, copy_out);
+    PipeBarrier<PIPE_V>();
+
+    out_queue_.FreeTensor(out_local);
+    in_queue_.FreeTensor(in_local);
+}
+
+template <typename T>
+__aicore__ inline void KernelGroupedMatmulSwigluAwq<T>::AicMatmul1Group(uint32_t g, uint32_t prev, uint32_t curr,
+                                                                        uint32_t block_start, uint32_t block_end)
+{
+    uint32_t overlap_start = (prev > block_start) ? prev : block_start;
+    uint32_t overlap_end = (curr < block_end) ? curr : block_end;
+    if (overlap_start >= overlap_end) {
+        return;
+    }
+
+    uint32_t k = tiling_->k;
+    uint32_t n1 = tiling_->n1;
+    uint32_t single_m = tiling_->single_m;
+    uint32_t local_start = overlap_start - prev;
+    uint32_t local_end = overlap_end - prev;
+
+    for (uint32_t mm = local_start; mm < local_end; mm += single_m) {
+        uint32_t cur_m = (mm + single_m <= local_end) ? single_m : (local_end - mm);
+        uint64_t x_offset = static_cast<uint64_t>(prev + mm) * k;
+        uint64_t y_offset = static_cast<uint64_t>(overlap_start - block_start + (mm - local_start)) * n1;
+        mm1_.SetOrgShape(cur_m, n1, k);
+        mm1_.SetSingleShape(cur_m, n1, k);
+        mm1_.SetTensorA(x_gm_[x_offset], false);
+        mm1_.SetTensorB(w1_deq_gm_, false);
+        mm1_.template IterateAll<false>(gate_up_gm_[y_offset], 0);
+    }
+}
+
+template <typename T>
+__aicore__ inline void KernelGroupedMatmulSwigluAwq<T>::AicMatmul2Group(uint32_t g, uint32_t prev, uint32_t curr,
+                                                                        uint32_t block_start, uint32_t block_end)
+{
+    uint32_t overlap_start = (prev > block_start) ? prev : block_start;
+    uint32_t overlap_end = (curr < block_end) ? curr : block_end;
+    if (overlap_start >= overlap_end) {
+        return;
+    }
+
+    uint32_t n1 = tiling_->n1;
+    uint32_t n2 = tiling_->n2;
+    uint32_t k2 = n1 / 2;
+    uint32_t single_m = tiling_->single_m;
+    uint32_t local_start = overlap_start - prev;
+    uint32_t local_end = overlap_end - prev;
+
+    for (uint32_t mm = local_start; mm < local_end; mm += single_m) {
+        uint32_t cur_m = (mm + single_m <= local_end) ? single_m : (local_end - mm);
+        uint64_t x_offset = static_cast<uint64_t>(overlap_start - block_start + (mm - local_start)) * k2;
+        uint64_t y_offset = static_cast<uint64_t>(prev + mm) * n2;
+        mm2_.SetOrgShape(cur_m, n2, k2);
+        mm2_.SetSingleShape(cur_m, n2, k2);
+        mm2_.SetTensorA(inter_gm_[x_offset], false);
+        mm2_.SetTensorB(w2_deq_gm_, false);
+        mm2_.template IterateAll<false>(y_gm_[y_offset], 0);
+    }
+}
+
+template <typename T>
+__aicore__ inline void KernelGroupedMatmulSwigluAwq<T>::AivSwigluGroup(uint32_t g, uint32_t prev, uint32_t curr,
+                                                                       uint32_t block_start, uint32_t block_end)
+{
+    uint32_t overlap_start = (prev > block_start) ? prev : block_start;
+    uint32_t overlap_end = (curr < block_end) ? curr : block_end;
+    if (overlap_start >= overlap_end) {
+        return;
+    }
+
+    uint32_t rows = overlap_end - overlap_start;
+    uint32_t half_rows = (rows + 1) / 2;
+    uint32_t aiv_start = overlap_start + sub_block_idx_ * half_rows;
+    uint32_t aiv_end = aiv_start + half_rows;
+    if (aiv_end > overlap_end) {
+        aiv_end = overlap_end;
+    }
+    if (aiv_start >= aiv_end) {
+        return;
+    }
+
+    for (uint32_t row = aiv_start; row < aiv_end; ++row) {
+        SwigluRow(row - block_start);
+    }
+}
+
+template <typename T>
+__aicore__ inline void KernelGroupedMatmulSwigluAwq<T>::Process()
+{
+    uint32_t block_start = block_idx_ * tiling_->block_m;
+    uint32_t block_end = block_start + tiling_->block_m;
+    if (block_end > tiling_->m) {
+        block_end = tiling_->m;
+    }
+    // MIX_AIC_1_2 runs in batchmode; every block (even empty) must participate
+    // in the same number of global SyncAll barriers, otherwise the sync will
+    // wait forever for cores that returned early.
+    if (kDiagStage == 0) {
+        AscendC::SyncAll();
+        return;
+    }
+
+    const bool has_work = (block_start < block_end);
+
+    uint32_t prev = 0;
+    for (uint32_t g = 0; g < tiling_->group_num; ++g) {
+        uint32_t curr = static_cast<uint32_t>(group_list_gm_.GetValue(g));
+
+        if (has_work && kDiagStage >= 1) {
+            if ASCEND_IS_AIV {
+                if (sub_block_idx_ == 0) {
+                    DequantWeight1(g, w1_deq_gm_);
+                }
+            }
+        }
+        AscendC::SyncAll();
+
+        if (has_work && kDiagStage >= 2) {
+            if ASCEND_IS_AIC {
+                AicMatmul1Group(g, prev, curr, block_start, block_end);
+            }
+        }
+        AscendC::SyncAll();
+
+        if (has_work && kDiagStage >= 3) {
+            if ASCEND_IS_AIV {
+                AivSwigluGroup(g, prev, curr, block_start, block_end);
+                if (sub_block_idx_ == 0) {
+                    DequantWeight2(g, w2_deq_gm_);
+                }
+            }
+        }
+        AscendC::SyncAll();
+
+        if (has_work && kDiagStage >= 4) {
+            if ASCEND_IS_AIC {
+                AicMatmul2Group(g, prev, curr, block_start, block_end);
+            }
+        }
+        AscendC::SyncAll();
+
+        prev = curr;
+    }
+}
+
+extern "C" __global__ __aicore__ void grouped_matmul_swiglu_awq(GM_ADDR x,
+                                                                 GM_ADDR weight1, GM_ADDR weight1_scale, GM_ADDR weight1_offset,
+                                                                 GM_ADDR weight2, GM_ADDR weight2_scale, GM_ADDR weight2_offset,
+                                                                 GM_ADDR group_list,
+                                                                 GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    // REGISTER_TILING_DEFAULT(GroupedMatmulSwigluAwqTilingData);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    return; // STAGE-0 PROBE: kernel body intentionally empty
+    AscendC::TPipe pipe;
+    if (TILING_KEY_IS(0UL)) {
+        KERNEL_TASK_TYPE(0UL, KERNEL_TYPE_MIX_AIC_1_2);
+        return; // STAGE-0 PROBE: kernel body intentionally empty
+        GET_TILING_DATA_WITH_STRUCT(GroupedMatmulSwigluAwqTilingData, td, tiling);
+        KernelGroupedMatmulSwigluAwq<DTYPE_X> op(&pipe);
+        op.Init(x, weight1, weight1_scale, weight1_offset,
+                weight2, weight2_scale, weight2_offset, group_list, y, workspace, &td);
+        op.Process();
+    }
+}

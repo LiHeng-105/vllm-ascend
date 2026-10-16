@@ -18,6 +18,7 @@
 
 
 import torch
+import os
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
@@ -25,6 +26,12 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.utils import is_310p, vllm_version_is
+
+# Module-level gate so torch.compile folds the diagnostic branch away.
+# A hot-path os.environ.get(...) + logging.getLogger(...) inside forward()
+# breaks Dynamo graph capture and forces eager (a few tok/s). Evaluated once
+# at import; compile sees a constant and prunes the whole block.
+_AWQ_DIAG = os.environ.get("VLLM_ASCEND_AWQ_DIAG", "0") == "1"
 
 if vllm_version_is("0.21.0"):
     from vllm.model_executor.layers.mamba.gdn_linear_attn import (  # type: ignore[import-not-found]
@@ -133,6 +140,17 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
+        # Diagnostic: check whether the MLP (AWQ MoE) corrupted the NPU context.
+        if _AWQ_DIAG:
+            try:
+                torch.npu.synchronize()
+                import logging as _logging
+                _logging.getLogger(__name__).warning("[AWQ_DIAG] after mlp synchronize ok (layer_idx=%s)", self.layer_idx)
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger(__name__).warning("[AWQ_DIAG] after mlp synchronize FAILED (layer_idx=%s): %s", self.layer_idx, e)
+                raise
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:

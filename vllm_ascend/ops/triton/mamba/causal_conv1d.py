@@ -546,6 +546,7 @@ def causal_conv1d_update_npu(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
+    inputs_in_kernel_layout: bool = False,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -583,6 +584,15 @@ def causal_conv1d_update_npu(
             for example: conv_state_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
+    inputs_in_kernel_layout: bool
+        When False (default), `weight` is expected as (dim, width) and
+        `conv_state` as (..., dim, state_len); both are transposed and made
+        contiguous internally. When True, the caller guarantees `weight` is
+        contiguous (dim, width) and `conv_state` is contiguous
+        (num_cache_lines, state_len, dim) — the kernel-native "SD" layout,
+        e.g. the GDN conv-state cache. This skips the per-call
+        transpose().contiguous() copies, which would otherwise duplicate the
+        whole conv-state cache on every call.
     out: (batch, dim) or (batch, dim, seqlen) or (num_tokens, dim), same shape as `x`
     """
     if not HAS_TRITON:
@@ -598,8 +608,17 @@ def causal_conv1d_update_npu(
             pad_slot_id=pad_slot_id,
         )
 
-    weight = weight.transpose(0, 1).contiguous()
-    conv_state = conv_state.transpose(1, 2).contiguous()
+    if inputs_in_kernel_layout:
+        # weight: contiguous (dim, width); conv_state: contiguous
+        # (num_cache_lines, state_len, dim). View the weight transposed so the
+        # stride unpack below yields the same kernel-visible layout as the
+        # post-copy default path, without copying anything.
+        assert weight.stride(-1) == 1, "kernel-layout weight must be contiguous (dim, width)"
+        assert conv_state.stride(-1) == 1, "kernel-layout conv_state must be contiguous (lines, state_len, dim)"
+        weight = weight.transpose(0, 1)
+    else:
+        weight = weight.transpose(0, 1).contiguous()
+        conv_state = conv_state.transpose(1, 2).contiguous()
     if validate_data:
         assert pad_slot_id is not None
         assert x.stride(1) == 1

@@ -40,8 +40,9 @@ class AscendRMSNorm(RMSNorm):
         self.bias_loaded = False
 
         # quantization with anti_method m4 will generate none-zero norm bias
-        if vllm_config.quant_config is not None and any(
-            "norm.bias" in name for name in vllm_config.quant_config.quant_description
+        quant_description = getattr(vllm_config.quant_config, "quant_description", None)
+        if vllm_config.quant_config is not None and quant_description is not None and any(
+            "norm.bias" in name for name in quant_description
         ):
             self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
             self.bias.weight_loader = self._bias_weight_loader
@@ -140,6 +141,19 @@ class LayerNormFn(torch.autograd.Function):
         weight = weight.contiguous()
         if bias is not None:
             bias = bias.contiguous()
+        # Workaround: ensure the current NPU device/context matches the input
+        # tensor before launching the Triton kernel. In TP spawn workers the
+        # ACL context can drift after model loading, causing
+        # _npu_getCurrentRawStream to fail with ERR00100.
+        # Guarded to eager-only: under torch.compile the device is bound for
+        # the whole captured region, and both set_device() (gb0007
+        # "Attempted to call function marked as skipped") and synchronize()
+        # are illegal inside a captured graph. is_compiling() is constant-
+        # folded by Dynamo, so these are pruned from the compiled graph and
+        # kept only for eager runs.
+        if not torch.compiler.is_compiling():
+            torch.npu.set_device(x.device)
+            torch.npu.synchronize()
         y, mean, rstd = layer_norm_fwd_npu(
             x,
             weight,

@@ -39,6 +39,7 @@
 #include "mc2/dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
+#include "gmm/grouped_matmul_swiglu_awq/grouped_matmul_swiglu_awq_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
@@ -2292,6 +2293,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                                  (Tensor output, Tensor output_scale)"
     );
     ops.impl("grouped_matmul_swiglu_quant_v2", torch::kPrivateUse1, &vllm_ascend::grouped_matmul_swiglu_quant_v2);
+
+    ops.def(
+        "grouped_matmul_swiglu_awq(Tensor x, Tensor weight1, Tensor weight1_scale, Tensor weight1_offset,"
+        "                          Tensor weight2, Tensor weight2_scale, Tensor weight2_offset,"
+        "                          Tensor group_list, *, int group_list_type=1, int group_size=128, float swiglu_limit=0.0) -> Tensor"
+    );
+    ops.impl("grouped_matmul_swiglu_awq", torch::kPrivateUse1, &vllm_ascend::grouped_matmul_swiglu_awq);
 
     ops.def(
         "npu_lightning_indexer("

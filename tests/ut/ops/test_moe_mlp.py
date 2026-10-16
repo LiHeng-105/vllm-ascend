@@ -1,9 +1,10 @@
 import unittest
 from typing import ClassVar
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
@@ -180,6 +181,70 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
         quant_kwargs = mock_quant.call_args.kwargs
         self.assertTrue(quant_kwargs["use_w4a8_per_channel_gmm_swiglu"])
         mock_unquant.assert_not_called()
+
+    def test_awq_path_uses_antiquant_grouped_matmul(self):
+        hidden_states = torch.randn(4, 8, dtype=torch.float16)
+        group_list = torch.tensor([2, 2], dtype=torch.int64)
+        w1 = torch.randint(0, 16, (1, 4, 8), dtype=torch.int32)
+        w2 = torch.randint(0, 16, (1, 8, 4), dtype=torch.int32)
+        w1_scale = torch.randn(1, 4, dtype=torch.float16)
+        w2_scale = torch.randn(1, 8, dtype=torch.float16)
+        w1_offset = torch.randint(-8, 8, (1, 4), dtype=torch.int32)
+        w2_offset = torch.randint(-8, 8, (1, 8), dtype=torch.int32)
+
+        mlp_compute_input = MoEMlpComputeInput(
+            hidden_states=hidden_states,
+            group_list=group_list,
+            group_list_type=1,
+            dynamic_scale=None,
+            topk_scales=None,
+            weights=MoEWeights(
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_offset=w1_offset,
+                w2_offset=w2_offset,
+            ),
+            quant=MoEQuantParams(quant_type=QuantType.AWQ),
+            fusion=False,
+            activation="silu",
+            need_trans=False,
+            dynamic_eplb=False,
+        )
+
+        mock_stream = MagicMock()
+        mock_extra_ctx = MagicMock()
+        mock_extra_ctx.moe_comm_type = MoECommType.ALLGATHER
+        with (
+            patch("vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_grouped_matmul") as mock_gmm,
+            patch("vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_swiglu") as mock_swiglu,
+            patch("torch.npu.current_stream", return_value=mock_stream),
+            patch("vllm_ascend.ops.fused_moe.moe_mlp._EXTRA_CTX", mock_extra_ctx),
+        ):
+            mock_gmm.return_value = [torch.randn(4, 16, dtype=torch.float16)]
+            mock_swiglu.return_value = torch.randn(4, 16, dtype=torch.float16)
+
+            unified_apply_mlp(mlp_compute_input=mlp_compute_input)
+
+        self.assertEqual(mock_gmm.call_count, 2)
+        expected_group_list = group_list
+
+        first_call = mock_gmm.call_args_list[0]
+        self.assertIn("antiquant_scale", first_call.kwargs)
+        self.assertIn("antiquant_offset", first_call.kwargs)
+        self.assertEqual(first_call.kwargs["output_dtype"], torch.float16)
+        self.assertEqual(first_call.kwargs["group_list_type"], 1)
+        self.assertTrue(torch.equal(first_call.kwargs["group_list"], expected_group_list))
+
+        second_call = mock_gmm.call_args_list[1]
+        self.assertIn("antiquant_scale", second_call.kwargs)
+        self.assertIn("antiquant_offset", second_call.kwargs)
+        self.assertEqual(second_call.kwargs["output_dtype"], torch.float16)
+        self.assertEqual(second_call.kwargs["group_list_type"], 1)
+        self.assertTrue(torch.equal(second_call.kwargs["group_list"], expected_group_list))
+
+        mock_stream.record_event.assert_called_once()
 
 
 if __name__ == "__main__":

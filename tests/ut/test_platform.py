@@ -12,7 +12,9 @@ from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_pro
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
+    AWQ_QUANTIZATION_METHOD,
     COMPRESSED_TENSORS_METHOD,
+    FP8_METHOD,
     AscendDeviceType,
 )
 
@@ -58,7 +60,13 @@ class TestNPUPlatform(TestBase):
         self._enable_sp_patch = patch("vllm_ascend.utils.enable_sp", return_value=False)
         self._enable_sp_patch.start()
         self.platform = NPUPlatform()
-        self.platform.supported_quantization[:] = ["ascend", "compressed-tensors"]
+        self.platform.supported_quantization[:] = [
+            "ascend",
+            "compressed-tensors",
+            "fp8",
+            "awq",
+            "deepseek_v4_fp8",
+        ]
 
     def tearDown(self):
         self._enable_sp_patch.stop()
@@ -71,7 +79,16 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.ray_device_key, "NPU")
         self.assertEqual(NPUPlatform.device_control_env_var, "ASCEND_RT_VISIBLE_DEVICES")
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
-        self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
+        self.assertEqual(
+            NPUPlatform.supported_quantization,
+            [
+                ASCEND_QUANTIZATION_METHOD,
+                COMPRESSED_TENSORS_METHOD,
+                FP8_METHOD,
+                AWQ_QUANTIZATION_METHOD,
+                "deepseek_v4_fp8",
+            ],
+        )
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
